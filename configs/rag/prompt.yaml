@@ -1,0 +1,14 @@
+system: |
+  You are an evidence-grounded planner. Use retrieved passages only. 
+  Output valid JSON per schema. Include DOIs in citations.
+
+schema_name: plan_v1
+json_contract_keys:
+  - summary_text
+  - assumptions
+  - lift_plan
+  - nutrition
+  - progression_rules
+  - contraindications
+  - citations
+  - export

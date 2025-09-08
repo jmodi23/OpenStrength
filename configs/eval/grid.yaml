@@ -1,0 +1,6 @@
+llms: ["phi3", "mistral-7b-instruct", "qwen2-7b-instruct"]
+embeddings: ["bge-large-en-v1.5","e5-large-v2","gte-large","instructor-large"]
+reranker: ["none","msmarco-minilm-l6-v2"]
+k: [10,20]
+chunk_tokens: [300,500]
+temperature: 0.2

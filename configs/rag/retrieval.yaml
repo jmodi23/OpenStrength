@@ -1,0 +1,4 @@
+k: 20
+rerank: true
+max_per_source: 3
+min_score: 0.0

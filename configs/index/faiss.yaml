@@ -1,0 +1,12 @@
+science:
+  type: hnsw
+  hnsw:
+    m: 32
+    ef_construction: 200
+  ef_search: 64
+plan:
+  type: hnsw
+  hnsw:
+    m: 32
+    ef_construction: 200
+  ef_search: 64

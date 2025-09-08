@@ -1,0 +1,9 @@
+base_model: "mistral-7b-instruct"
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+bnb_4bit: true
+lr: 2e-4
+bsz: 64
+epochs: 3
+save_dir: "artifacts/models/lora"
