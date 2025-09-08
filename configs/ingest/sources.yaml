@@ -1,0 +1,72 @@
+time_window:
+  start: "2010-01-01"
+  end: "2025-09-08"
+
+paths:
+  raw_dir: "data/raw"
+  snapshots_dir: "data/snapshots"
+
+licenses:
+  allow:
+    - CC-BY-4.0
+    - CC-BY-3.0
+    - CC-BY-SA-4.0
+    - CC0-1.0
+    - US-Gov-PD
+    - Public-Domain
+
+pmc:
+  enabled: true
+  queries:
+    - 'creatine[Title/Abstract] AND open access[filter]'
+    - '("strength training" OR "resistance training" OR hypertrophy) AND open access[filter]'
+    - '("nutrition" OR "dietetics" OR "dietary protein") AND open access[filter]'
+  max_results_per_query: 5000
+  email: "youremail@example.com"      # required by NCBI
+  api_key: ""                         # optional; speeds limits if set
+  rate_per_sec: 3
+
+arxiv:
+  enabled: true
+  queries:
+    - 'ti:"creatine" OR abs:"creatine"'
+    - 'ti:"strength training" OR abs:"resistance training" OR abs:hypertrophy'
+    - 'ti:nutrition OR abs:nutrition OR ti:dietetics OR abs:dietetics'
+  categories:
+    - q-bio
+    - cs.LG
+    - stat.ML
+  max_results_per_query: 2000
+  rate_per_sec: 1
+
+biorxiv:
+  enabled: true
+  queries:
+    - "creatine"
+    - "strength training"
+    - "resistance training"
+    - "hypertrophy"
+    - "nutrition"
+    - "dietetics"
+  license_whitelist:
+    - "cc-by"
+    - "cc0"
+    - "cc-by-sa"
+  rate_per_sec: 1
+
+gov:
+  enabled: true
+  seeds:
+    - "https://health.gov/our-work/nutrition-physical-activity/dietary-guidelines"
+    - "https://www.cdc.gov/physicalactivity/basics/index.htm"
+    - "https://www.who.int/publications"
+    - "https://fdc.nal.usda.gov/download-datasets.html"
+  allow_domains:
+    - "health.gov"
+    - "cdc.gov"
+    - "who.int"
+    - "nal.usda.gov"
+  filetypes:
+    - ".pdf"
+    - ".html"
+  rate_per_sec: 1
