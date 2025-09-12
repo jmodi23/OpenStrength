@@ -18,12 +18,12 @@ licenses:
 pmc:
   enabled: true
   queries:
-    - 'creatine[Title/Abstract] AND open access[filter]'
-    - '("strength training" OR "resistance training" OR hypertrophy) AND open access[filter]'
-    - '("nutrition" OR "dietetics" OR "dietary protein") AND open access[filter]'
+    - 'creatine[tiab] AND 2010:2025[PDAT]'
+    - '(strength training[tiab] OR resistance training[tiab] OR hypertrophy[tiab]) AND 2010:2025[PDAT]'
+    - '(nutrition[tiab] OR dietetics[tiab] OR "dietary protein"[tiab]) AND 2010:2025[PDAT]'
   max_results_per_query: 5000
-  email: "youremail@example.com"      # required by NCBI
-  api_key: ""                         # optional; speeds limits if set
+  email: "mjainil1201@gmail.com"
+  api_key: ""
   rate_per_sec: 3
 
 arxiv:
@@ -70,3 +70,83 @@ gov:
     - ".pdf"
     - ".html"
   rate_per_sec: 1
+
+parallelism:
+  max_workers: 8
+
+unpaywall:
+  enabled: true
+  email: "you@example.com"         # REQUIRED by Unpaywall
+  queries:
+    - "creatine"
+    - "\"resistance training\" OR \"strength training\" OR hypertrophy"
+    - "nutrition OR dietetics OR \"dietary protein\""
+  from: "2010-01-01"
+  to:   "2025-09-08"
+  rows_per_page: 100
+  rate_per_sec: 3
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0", "public-domain"]
+
+doaj:
+  enabled: true
+  queries:
+    - "creatine"
+    - "\"resistance training\" OR \"strength training\" OR hypertrophy"
+    - "nutrition OR dietetics OR \"dietary protein\""
+  page_size: 100
+  pages: 30
+  rate_per_sec: 2
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0"]
+
+core:
+  enabled: false                    # set true if you have an API key
+  api_key: ""
+  queries:
+    - "creatine"
+    - "\"resistance training\" OR \"strength training\" OR hypertrophy"
+    - "nutrition OR dietetics OR \"dietary protein\""
+  page_size: 100
+  pages: 50
+  rate_per_sec: 2
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0"]
+
+oai_pmh:
+  enabled: true
+  # institutional repositories; add more as needed
+  endpoints:
+    - "https://dash.harvard.edu/oai/request"
+    - "https://dspace.mit.edu/oai/request"
+  metadata_prefix: "oai_dc"
+  queries:
+    - "creatine"
+    - "resistance training"
+    - "strength training"
+    - "hypertrophy"
+    - "nutrition"
+    - "dietetics"
+  from: "2010-01-01"
+  to:   "2025-09-08"
+  rate_per_sec: 1
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0", "public domain"]
+
+zenodo:
+  enabled: true
+  queries:
+    - "creatine"
+    - "\"strength training\" OR \"resistance training\" OR hypertrophy"
+    - "nutrition OR dietetics"
+  page_size: 100
+  pages: 20
+  rate_per_sec: 2
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0", "public-domain", "pddl"]
+
+figshare:
+  enabled: true
+  queries:
+    - "creatine"
+    - "\"strength training\" OR \"resistance training\" OR hypertrophy"
+    - "nutrition OR dietetics"
+  page_size: 100
+  pages: 20
+  rate_per_sec: 2
+  license_whitelist: ["cc-by", "cc-by-sa", "cc0"]

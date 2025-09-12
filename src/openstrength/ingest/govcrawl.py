@@ -48,11 +48,19 @@ def harvest_gov(cfg: dict) -> None:
                             # fetch file
                             _sleep(rate)
                             fr = requests.get(href, headers=HEADERS, timeout=60)
-                            if fr.ok:
+                            fr = requests.get(href, headers=HEADERS, timeout=60, allow_redirects=True)
+                        if fr.ok:
+                            ctype = fr.headers.get("Content-Type","").lower()
+                            if "application/pdf" in ctype:
                                 fn = re.sub(r"[^a-z0-9]+", "_", href.split("/")[-1].lower())
+                                if not fn.endswith(".pdf"):
+                                    fn += ".pdf"
                                 path = out_dir / fn
                                 path.write_bytes(fr.content)
                                 pbar.total += 1; pbar.update(1)
+                            else:
+                                # skip HTML masquerading as PDF
+                                continue
                         elif href.startswith("http"):
                             to_visit.append(href)
                 except Exception:
