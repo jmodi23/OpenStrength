@@ -25,6 +25,7 @@ pmc:
   email: "mjainil1201@gmail.com"
   api_key: ""
   rate_per_sec: 3
+  permit_unlicensed_readonly: false # set true if you want to save but flag as restricted
 
 arxiv:
   enabled: true

@@ -1,182 +1,133 @@
-#!/usr/bin/env python3
-# -- coding: utf-8 --
-
-"""
-Central runner for OpenStrength ingestion.
-
-- Reads sources.yaml
-- Dispatches to per-source run_from_config(name, cfg, out_root) functions
-- Handles --only / --skip filters
-- OAI-PMH logic is intentionally commented out (see the stub below)
-
-Usage:
-  python run.py --sources sources.yaml --out data/raw
-  python run.py --sources sources.yaml --out data/raw --only pmc,arxiv
-  python run.py --sources sources.yaml --out data/raw --skip oai_pmh
-"""
-
+# src/openstrength/ingest/run.py
 from __future__ import annotations
-import os
-import sys
-import json
-import time
-import argparse
-from typing import Any, Dict
+import argparse, importlib, inspect, json, sys, traceback
+from pathlib import Path
 
-# --- lightweight YAML loader ---
 try:
-    import yaml
+    import yaml  # pyyaml
 except Exception as e:
-    raise SystemExit("ERROR: You need PyYAML installed: pip install pyyaml") from e
+    print("FATAL: PyYAML not installed. pip install pyyaml", file=sys.stderr)
+    raise
 
+DEFAULT_SOURCE_ORDER = [
+    "pmc",
+    "arxiv",
+    "biorxiv",
+    "gov",
+    "unpaywall",
+    "doaj",
+    "oai_pmh",
+    "zenodo",
+    "figshare",
+]
 
-def load_yaml(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
-
-
-# --- lazy imports & dispatch ---
-
-def _import_runner(modname: str):
-    """
-    Import a module and fetch its run_from_config. Returns None if missing.
-    """
-    try:
-        mod = __import__(modname, fromlist=["run_from_config"])
-        return getattr(mod, "run_from_config", None)
-    except Exception:
-        return None
-
-
-DISPATCH = {
-    # working & updated sources
-    "pmc": _import_runner("pmc"),
-    "arxiv": _import_runner("arxiv"),
-    "unpaywall": _import_runner("unpaywall"),
-    "zenodo": _import_runner("zenodo"),
-
-    # comment out oai_pmh (see stub below)
-    # "oai_pmh": _import_runner("oai_pmh"),
-
-    # keep placeholders for others you might add later
-    "biorxiv": _import_runner("biorxiv"),
-    "gov": _import_runner("govcrawl"),   # if your module is govcrawl.py
-    "doaj": _import_runner("doaj"),
+# For each source, try these candidate entrypoint names in order.
+CANDIDATE_FUNCS = {
+    "pmc":       ["run_from_config", "harvest_pmc", "run", "main", "entrypoint"],
+    "arxiv":     ["run_from_config", "harvest_arxiv", "run", "main", "entrypoint"],
+    "biorxiv":   ["run_from_config", "harvest_biorxiv", "run", "main", "entrypoint"],
+    "gov":       ["run_from_config", "crawl", "run", "main", "entrypoint", "harvest_gov"],
+    "unpaywall": ["run_from_config", "harvest_unpaywall", "run", "main", "entrypoint"],
+    "doaj":      ["run_from_config", "harvest_doaj", "run", "main", "entrypoint"],
+    "oai_pmh":   ["run_from_config", "harvest_oai_pmh", "run", "main", "entrypoint"],
+    "zenodo":    ["run_from_config", "harvest_zenodo", "run", "main", "entrypoint"],
+    "figshare":  ["run_from_config", "harvest_figshare", "run", "main", "entrypoint"],
 }
 
+# Map source name -> import path (module file name under src/openstrength/ingest/)
+MODULE_PATHS = {
+    "pmc":       "src.openstrength.ingest.pmc",
+    "arxiv":     "src.openstrength.ingest.arxiv",
+    "biorxiv":   "src.openstrength.ingest.biorxiv",
+    "gov":       "src.openstrength.ingest.govcrawl",
+    "unpaywall": "src.openstrength.ingest.unpaywall",
+    "doaj":      "src.openstrength.ingest.doaj",
+    "oai_pmh":   "src.openstrength.ingest.oai_pmh",
+    "zenodo":    "src.openstrength.ingest.zenodo",
+    "figshare":  "src.openstrength.ingest.figshare",
+}
 
-def available_sources():
-    return [k for k, v in DISPATCH.items() if v is not None]
+def load_yaml(p: Path) -> dict:
+    with p.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
+def call_runner(mod, func_name: str, cfg: dict) -> None:
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        raise AttributeError(f"function {func_name} not found")
 
-def run_source(name: str, cfg: Dict[str, Any], out_root: str):
-    fn = DISPATCH.get(name)
-    if fn is None:
-        print(f"[skip] {name}: no runner found (module missing or no run_from_config).")
-        return {"source": name, "status": "missing"}
-    print(f"[run] {name} ...")
-    t0 = time.time()
+    # Try (cfg) first; if the function doesn’t accept args, fall back to no-arg call.
     try:
-        stats = fn(name, cfg or {}, out_root)
-        dt = time.time() - t0
-        # Best-effort pretty print of dataclass/dict
-        if hasattr(stats, "_dict_"):
-            stats_obj = stats._dict_
-        elif isinstance(stats, dict):
-            stats_obj = stats
+        sig = inspect.signature(fn)
+        if len([p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]) >= 1:
+            return fn(cfg)  # try passing the config
         else:
-            try:
-                from dataclasses import asdict
-                stats_obj = asdict(stats)
-            except Exception:
-                stats_obj = {"_repr": repr(stats)}
-        print(json.dumps({"source": name, "elapsed_sec": round(dt, 2), "stats": stats_obj}, indent=2))
-        return {"source": name, "elapsed_sec": dt, "stats": stats_obj, "status": "ok"}
-    except KeyboardInterrupt:
-        raise
+            return fn()     # no-arg function
+    except TypeError:
+        # Try the opposite calling convention
+        try:
+            return fn()
+        except TypeError:
+            return fn(cfg)
+
+def run_source(name: str, cfg: dict) -> tuple[str, str]:
+    # Disabled?
+    scfg = cfg.get(name, {})
+    enabled = bool(scfg.get("enabled", False))
+    if not enabled:
+        # keep your existing “disabled” messaging style
+        tag = name.upper() if name in ("gov","unpaywall","doaj","zenodo") else name
+        return "ok", f"[{tag.capitalize()}] disabled in config; skipping"
+
+    # Import the module
+    mod_path = MODULE_PATHS.get(name)
+    if not mod_path:
+        return "skip", f"[skip] {name}: no module path mapping."
+
+    try:
+        mod = importlib.import_module(mod_path)
     except Exception as e:
-        dt = time.time() - t0
-        print(json.dumps({"source": name, "elapsed_sec": round(dt, 2), "error": str(e)}, indent=2))
-        return {"source": name, "elapsed_sec": dt, "error": str(e), "status": "error"}
+        return "skip", f"[skip] {name}: cannot import module ({e})."
 
+    # Try candidates
+    for cand in CANDIDATE_FUNCS.get(name, []):
+        try:
+            call_runner(mod, cand, cfg)
+            return "ok", f"[ok]   {name}"
+        except AttributeError:
+            continue
+        except Exception as e:
+            tb = traceback.format_exc(limit=1)
+            return "error", f"[error] {name}: {e}\n{tb}"
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="OpenStrength central ingestion runner")
-    p.add_argument("--sources", default="sources.yaml", help="Path to sources.yaml")
-    p.add_argument("--out", default="data/raw", help="Root output directory")
-    p.add_argument("--only", default="", help="Comma-separated subset of sources to run")
-    p.add_argument("--skip", default="", help="Comma-separated sources to skip")
-    return p.parse_args(argv)
+    return "skip", f"[skip] {name}: no runner found (module missing or no supported entrypoint)."
 
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sources", type=str, required=True, help="Path to sources.yaml")
+    args = ap.parse_args()
 
-def main(argv=None):
-    args = parse_args(argv)
-    cfg_all = load_yaml(args.sources)
+    src_path = Path(args.sources)
+    cfg = load_yaml(src_path)
 
-    ensure_dir(args.out)
-
-    only = set([s.strip() for s in args.only.split(",") if s.strip()]) if args.only else set()
-    skip = set([s.strip() for s in args.skip.split(",") if s.strip()]) if args.skip else set()
-
-    # Determine run order: YAML key order if possible, else alphabetical.
-    # PyYAML preserves mapping order since Python 3.7.
-    declared_order = list(cfg_all.keys()) if isinstance(cfg_all, dict) else []
-    known = set(DISPATCH.keys())
-    run_list = [s for s in declared_order if s in known] or sorted(available_sources())
+    out_root = (cfg.get("paths") or {}).get("raw_dir", "data/raw")
+    print(f"==> starting run: out_root='{out_root}'")
+    print(f"==> sources file: '{src_path}'")
 
     results = []
-    print(f"==> starting run: out_root='{args.out}'")
-    print(f"==> sources file: '{args.sources}'")
-    if only:
-        print(f"==> ONLY: {sorted(only)}")
-    if skip:
-        print(f"==> SKIP: {sorted(skip)}")
+    for name in DEFAULT_SOURCE_ORDER:
+        status, msg = run_source(name, cfg)
+        print(msg)
+        results.append((name, status))
 
-    for name in run_list:
-        if only and name not in only:
-            print(f"[skip] {name}: not in --only")
-            continue
-        if name in skip:
-            print(f"[skip] {name}: in --skip")
-            continue
-
-        cfg = cfg_all.get(name, {}) if isinstance(cfg_all, dict) else {}
-        enabled = bool(cfg.get("enabled", True))
-        if not enabled:
-            print(f"[skip] {name}: enabled=false")
-            continue
-
-        # --- OAI-PMH: intentionally disabled/commented out -------------------
-        if name in ("oai_pmh", "pmh", "oai"):
-            print(f"[skip] {name}: OAI-PMH logic is commented out in runner (see stub).")
-            # If you want to re-enable later, implement oai_pmh.run_from_config
-            # and then remove the skip above. For reference, your OLD logic likely looked like:
-            #
-            #   from oai_pmh import harvest_oai
-            #   stats = harvest_oai(topic=..., out_dir=..., years=..., ...)
-            #
-            # We’ve standardized around per-module run_from_config(name, cfg, out_root).
-            # -------------------------------------------------------------------
-            continue
-
-        results.append(run_source(name, cfg, args.out))
-
-    # Short summary
-    ok = sum(1 for r in results if r.get("status") == "ok")
-    err = sum(1 for r in results if r.get("status") == "error")
-    miss = sum(1 for r in results if r.get("status") == "missing")
-    print("\n==> summary")
-    print(json.dumps({
+    summary = {
         "total": len(results),
-        "ok": ok,
-        "error": err,
-        "missing": miss,
-    }, indent=2))
-
+        "ok": sum(1 for _, s in results if s == "ok"),
+        "error": sum(1 for _, s in results if s == "error"),
+        "missing": sum(1 for _, s in results if s == "skip"),
+    }
+    print("\n==> summary")
+    print(json.dumps(summary, indent=2))
 
 if __name__ == "__main__":
     main()

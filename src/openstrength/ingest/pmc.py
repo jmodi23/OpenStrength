@@ -1,76 +1,72 @@
 # src/openstrength/ingest/pmc.py
 from __future__ import annotations
 
-import json
+import os
 import re
+import json
 import time
-from pathlib import Path
-from typing import List, Optional, Tuple
-from urllib.parse import urlencode
+import errno
+import hashlib
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter, Retry
-from tqdm import tqdm
 
-EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-HEADERS = {"User-Agent": "OpenStrength/0.1 (contact: mjainil1201@gmail.com)"}
+try:
+    from tqdm import tqdm
+except Exception:
+    # very small shim if tqdm isn't available
+    def tqdm(it, **kw):
+        return it
 
 
 # ---------------------------
 # Helpers
 # ---------------------------
 
-def _sleep(rate_per_sec: float) -> None:
+PMC_BASE = "https://www.ncbi.nlm.nih.gov/pmc/articles"
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+def _mkdir_p(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+def _rate_sleep(rate_per_sec: float) -> None:
     if rate_per_sec and rate_per_sec > 0:
-        time.sleep(1.0 / rate_per_sec)
+        time.sleep(max(0.0, 1.0 / float(rate_per_sec)))
 
-
-def _session() -> requests.Session:
-    """HTTP session with retries/backoff for resilience."""
+def _mk_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update(HEADERS)
+    s.headers.update({
+        "User-Agent": "OpenStrength/ingest (PMCID harvester)",
+        "Accept": "*/*",
+    })
+    s.timeout = 30
     return s
 
+def _choose_parser() -> str:
+    # Try robust fallbacks; works even without lxml installed.
+    for p in ("lxml-xml", "xml", "lxml", "html.parser"):
+        try:
+            BeautifulSoup("<x/>", p)  # quick sanity check
+            return p
+        except Exception:
+            continue
+    return "html.parser"
 
-def _sanitize_dirname(name: str, maxlen: int = 48) -> str:
-    """Windows-safe, relatively short dirname (avoid MAX_PATH issues)."""
-    name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-    return name[:maxlen] if len(name) > maxlen else name
-
-
-def safe_write(path: Path, content: bytes | str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, str):
-        path.write_text(content, encoding="utf-8", errors="ignore")
-    else:
-        path.write_bytes(content)
-
+XML_PARSER = _choose_parser()
 
 # ---------------------------
 # E-utilities
 # ---------------------------
 
-def esearch_pmc(
-    term: str,
-    start: str,
-    end: str,
-    email: str,
-    api_key: Optional[str],
-    rate: float,
-    retmax: int = 100000,
-    sess: Optional[requests.Session] = None,
-) -> List[str]:
-    """Search PMC and return a list of PMCID (numeric) strings."""
-    s = sess or _session()
+def esearch_pmc_ids(term: str, email: str, api_key: str, retmax: int, rate: float, sess: requests.Session) -> List[str]:
+    """
+    Return a list of PMCID strings (like 'PMC1234567') for a search term.
+    """
     params = {
         "db": "pmc",
         "term": term,
@@ -80,196 +76,405 @@ def esearch_pmc(
     }
     if api_key:
         params["api_key"] = api_key
-    url = EUTILS + "esearch.fcgi?" + urlencode(params)
-    _sleep(rate)
-    r = s.get(url, timeout=30)
+
+    url = f"{EUTILS}/esearch.fcgi"
+    _rate_sleep(rate)
+    r = sess.get(url, params=params)
     r.raise_for_status()
-    js = r.json()
-    ids = js.get("esearchresult", {}).get("idlist", [])
-    print(f"[PMC] term='{term}' -> {len(ids)} ids")
-    return ids
+    data = r.json()
+    ids = data.get("esearchresult", {}).get("idlist", []) or []
+    # Convert numeric ids to PMCID format for convenience
+    pmcids = [f"PMC{_id}" if not str(_id).startswith("PMC") else str(_id) for _id in ids]
+    return pmcids
 
 
-def efetch_pmc_xml(
-    pmcid: str,
-    email: str,
-    api_key: Optional[str],
-    rate: float,
-    sess: Optional[requests.Session] = None,
-) -> str:
-    """Fetch PMC JATS/XML for a PMCID."""
-    s = sess or _session()
-    params = {"db": "pmc", "id": pmcid, "retmode": "xml", "email": email}
+def efetch_pmc_xml(pmcid: str, email: str, api_key: str, rate: float, sess: requests.Session) -> str:
+    """
+    Fetch the JATS XML for a PMCID. Returns text (XML).
+    """
+    numeric = pmcid.replace("PMC", "")
+    params = {
+        "db": "pmc",
+        "id": numeric,
+        "retmode": "xml",
+        "email": email,
+    }
     if api_key:
         params["api_key"] = api_key
-    url = EUTILS + "efetch.fcgi?" + urlencode(params)
-    _sleep(rate)
-    r = s.get(url, timeout=60)
+
+    url = f"{EUTILS}/efetch.fcgi"
+    _rate_sleep(rate)
+    r = sess.get(url, params=params)
     r.raise_for_status()
     return r.text
 
 
-def pmcid_to_pdf_url(pmcid: str) -> str:
-    """The common 'pdf' landing path (may return HTML)."""
-    return f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/pdf"
+# ---------------------------
+# License parsing
+# ---------------------------
+
+_CC_PAT = re.compile(r"creativecommons\.org/licenses/([a-z\-]+)/([0-9.]+)/?", re.I)
+_CC_ZERO_PAT = re.compile(r"creativecommons\.org/publicdomain/zero/([0-9.]+)/?", re.I)
+_PD_PAT = re.compile(r"public\s*domain|pd\b|us-?gov|work\s*of\s*the\s*us\s*government", re.I)
+
+def _norm_cc_tag(kind: str, ver: str) -> str:
+    kind = kind.lower()
+    ver = ver.strip()
+    mapping = {
+        "by": "CC-BY",
+        "by-sa": "CC-BY-SA",
+        "by-nd": "CC-BY-ND",
+        "by-nc": "CC-BY-NC",
+        "by-nc-sa": "CC-BY-NC-SA",
+        "by-nc-nd": "CC-BY-NC-ND",
+    }
+    base = mapping.get(kind, f"CC-{kind.upper()}")
+    return f"{base}-{ver}"
+
+def normalize_license(raw: str) -> Optional[str]:
+    """
+    Map raw license strings/URLs to normalized tags consistent with sources.yaml.
+    """
+    if not raw:
+        return None
+    txt = raw.strip()
+
+    # CC BY URLs
+    m = _CC_PAT.search(txt)
+    if m:
+        return _norm_cc_tag(m.group(1), m.group(2))
+
+    # CC0 URL
+    m = _CC_ZERO_PAT.search(txt)
+    if m:
+        return f"CC0-{m.group(1)}"
+
+    # Plain text variants
+    t = txt.lower()
+    # Common variants
+    if "cc by 4.0" in t or "cc-by 4.0" in t or "cc-by-4.0" in t or "attribution 4.0" in t:
+        return "CC-BY-4.0"
+    if "cc by 3.0" in t or "cc-by-3.0" in t or "attribution 3.0" in t:
+        return "CC-BY-3.0"
+    if "cc by-sa 4.0" in t or "cc-by-sa-4.0" in t or "attribution-sharealike 4.0" in t:
+        return "CC-BY-SA-4.0"
+    if "cc0" in t or "public domain dedication" in t:
+        return "CC0-1.0"
+
+    # US Gov / Public Domain
+    if _PD_PAT.search(t):
+        # Try to be specific when obvious
+        if "us" in t and "gov" in t:
+            return "US-Gov-PD"
+        return "Public-Domain"
+
+    return None
 
 
-def resolve_pdf_url_from_html(html: str, base: str) -> Optional[str]:
-    """When /pdf returns an HTML page, scrape for the real PDF link(s)."""
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.lower().endswith(".pdf") or "/pdf/" in href.lower():
-            return requests.compat.urljoin(base, href)
+def parse_license_from_xml(xml_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract a normalized license tag and the raw textual hint from JATS XML.
+    Returns (normalized_tag, raw_text_or_url)
+    """
+    soup = BeautifulSoup(xml_text, XML_PARSER)
+
+    # 1) <license> or ali:license or <license-p>
+    lic_nodes = []
+    lic_nodes += soup.find_all(["license", "license-p"])
+    lic_nodes += soup.find_all(attrs={"license-type": True})
+    # any element with rel="license" or xlink:href to cc
+    lic_nodes += soup.find_all(lambda tag: tag.name == "ext-link" and (tag.get("ext-link-type") == "uri" or tag.get("rel") == "license"))
+    lic_nodes += soup.find_all(lambda tag: any(k.endswith("href") and "creativecommons.org" in (tag.get(k) or "") for k in tag.attrs.keys()))
+
+    # 2) Check common attributes/urls
+    candidates: List[str] = []
+    for node in lic_nodes:
+        # href/xlink:href
+        for k, v in node.attrs.items():
+            if k.endswith("href") and isinstance(v, str):
+                candidates.append(v)
+        # text
+        if node.string and isinstance(node.string, str):
+            candidates.append(node.string)
+        txt = node.get_text(" ", strip=True)
+        if txt:
+            candidates.append(txt)
+
+    # 3) Extra: permissions block sometimes used
+    for node in soup.find_all(["permissions", "copyright-statement", "copyright-year"]):
+        txt = node.get_text(" ", strip=True)
+        if txt:
+            candidates.append(txt)
+
+    # 4) As a last resort look for any link to CC in the whole XML
+    for a in soup.find_all(["a", "ext-link"]):
+        href = a.get("href") or a.get("xlink:href") or a.get("href")
+        if href and "creativecommons.org" in href:
+            candidates.append(href)
+
+    # Decide
+    for c in candidates:
+        tag = normalize_license(c)
+        if tag:
+            return tag, c
+
+    # If nothing found, return None + best raw hint if present
+    return None, (candidates[0] if candidates else None)
+
+
+# ---------------------------
+# PDF URL discovery + download
+# ---------------------------
+
+def pdf_url_candidates(pmcid: str, xml_text: str) -> List[str]:
+    """
+    Build a list of candidate PDF URLs for a PMCID.
+    """
+    pmc_url = f"{PMC_BASE}/{pmcid}/"
+    base_pdf = f"{PMC_BASE}/{pmcid}/pdf/"
+    direct_pdf_named = f"{PMC_BASE}/{pmcid}/pdf/{pmcid}.pdf"
+    query_pdf = f"{PMC_BASE}/{pmcid}/?pdf=1"
+
+    cands = [direct_pdf_named, base_pdf, query_pdf]
+
+    # Find self-uri in XML (sometimes points at the PDF)
+    soup = BeautifulSoup(xml_text, XML_PARSER)
+    for su in soup.find_all("self-uri"):
+        href = su.get("href") or su.get("xlink:href")
+        if href:
+            if href.startswith("http"):
+                cands.append(href)
+            else:
+                # relative
+                cands.append(pmc_url + href.lstrip("/"))
+
+    # Unique preserve order
+    seen = set()
+    out = []
+    for u in cands:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def download_pdf(urls: Iterable[str], sess: requests.Session, rate: float, pmcid: str) -> Optional[bytes]:
+    """
+    Try each URL until a PDF is returned.
+    """
+    for url in urls:
+        try:
+            _rate_sleep(rate)
+            r = sess.get(url, allow_redirects=True, stream=True)
+            if r.status_code == 404:
+                print(f"[PMC] pdf-get failed pmcid={pmcid} status=404")
+                continue
+            r.raise_for_status()
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "pdf" not in ctype:
+                # Some PMC links respond with HTML; surface that for debugging
+                print(f"[PMC] self-uri failed pmcid={pmcid} url={url} ctype={ctype or 'UNKNOWN'}")
+                continue
+            return r.content
+        except requests.HTTPError as e:
+            print(f"[PMC] pdf-get failed pmcid={pmcid} status={getattr(e.response, 'status_code', '??')}")
+        except Exception as e:
+            print(f"[PMC] pdf-get failed pmcid={pmcid} err={e!r}")
     return None
 
 
 # ---------------------------
-# License detection
+# Main harvester
 # ---------------------------
 
-_CC_RE = re.compile(
-    r"(https?://)?creativecommons\.org/"
-    r"(?:(?:licenses/(?P<lic>by(?:-sa)?))/|publicdomain/(?P<pd>zero))/"
-    r"(?P<ver>\d(?:\.\d)?)",
-    re.IGNORECASE,
-)
+def harvest_pmc(
+    out_root: str,
+    queries: List[str],
+    email: str,
+    api_key: str,
+    retmax: int,
+    rate_per_sec: float,
+    allowed_licenses: List[str],
+    permit_unlicensed_readonly: bool = False,
+) -> Dict[str, int]:
+    """
+    Run PMC harvest across queries. Returns summary counters.
+    """
+    sess = _mk_session()
+    total_ids = 0
+    saved = 0
+    skipped_license = 0
+    pdf_fail = 0
+    xml_fail = 0
 
-
-def parse_license_from_xml(xml_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Detect permissive licenses in PMC JATS/XML."""
-    soup = BeautifulSoup(xml_text, "lxml-xml")
-
-    cand_nodes = []
-    cand_nodes += soup.find_all(["license", "ali:license_ref", "license-ref", "license-p"])
-    cand_nodes += soup.find_all("ext-link", attrs={"ext-link-type": "license"})
-    perms = soup.find("permissions")
-    if perms:
-        cand_nodes.append(perms)
-
-    texts: list[str] = []
-    for node in cand_nodes:
-        if not node:
+    for term in queries:
+        try:
+            ids = esearch_pmc_ids(term, email=email, api_key=api_key, retmax=retmax, rate=rate_per_sec, sess=sess)
+        except Exception as e:
+            print(f"[PMC] esearch failed term={term!r} err={e}")
             continue
-        href = getattr(node, "get", lambda *_: None)("xlink:href")
-        if href:
-            texts.append(href)
-        texts.append(node.get_text(" ", strip=True))
 
-    blob = " ".join(texts)
-    m = _CC_RE.search(blob) or _CC_RE.search(xml_text)
+        print(f"[PMC] term={term!r} -> {len(ids)} ids")
+        total_ids += len(ids)
 
-    norm: Optional[str] = None
-    url: Optional[str] = None
-    if m:
-        url = f"https://creativecommons.org/{'licenses/' + m.group('lic') if m.group('lic') else 'publicdomain/zero'}/{m.group('ver')}/"
-        lic = m.group("lic") or "zero"
-        ver = m.group("ver") or "1.0"
-        if lic == "by":
-            norm = f"CC-BY-{ver}"
-        elif lic == "by-sa":
-            norm = f"CC-BY-SA-{ver}"
-        elif lic == "zero":
-            norm = f"CC0-{ver}"
-    else:
-        lower_xml = xml_text.lower()
-        if "public domain" in lower_xml and ("us" in lower_xml or "government" in lower_xml):
-            norm = "US-Gov-PD"
+        # Per-query output dir
+        safe_term = re.sub(r"[^a-zA-Z0-9._-]+", "_", term)[:100].strip("_")
+        q_dir = os.path.join(out_root, "pmc", safe_term)
+        _mkdir_p(q_dir)
 
-    return norm, (url or (texts[0] if texts else None))
-
-
-# ---------------------------
-# Main harvest
-# ---------------------------
-
-def harvest_pmc(cfg: dict) -> None:
-    """Harvest PMC XML + (when licensed) PDFs."""
-    pmc = cfg["pmc"]
-    allowed = {a.lower() for a in cfg["licenses"]["allow"]}
-
-    raw_dir = Path(cfg["paths"]["raw_dir"]).resolve() / "pmc"
-    email = pmc["email"]
-    api_key = pmc.get("api_key") or None
-    rate = float(pmc.get("rate_per_sec", 3))
-
-    sess = _session()
-
-    for q in pmc["queries"]:
-        ids = esearch_pmc(q, cfg["time_window"]["start"], cfg["time_window"]["end"],
-                          email, api_key, rate, retmax=pmc["max_results_per_query"], sess=sess)
-        out_dir = raw_dir / _sanitize_dirname(q)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        pbar = tqdm(ids, desc=f"PMC fetch: {q}", unit="doc")
-        for pmcid in pbar:
-            meta_path = out_dir / f"PMC{pmcid}.meta.json"
-            xml_path = out_dir / f"PMC{pmcid}.xml"
-            pdf_path = out_dir / f"PMC{pmcid}.pdf"
+        # Iterate ids
+        for pmcid in tqdm(ids, desc=f"PMC fetch: {term}", unit="doc"):
             try:
-                # Fetch XML
-                xml = efetch_pmc_xml(pmcid, email, api_key, rate, sess=sess)
-                norm_tag, raw_license = parse_license_from_xml(xml)
-                meta = {
-                    "pmcid": pmcid,
-                    "license": norm_tag or "UNKNOWN",
-                    "license_raw": raw_license,
-                    "query": q,
-                }
-
-                safe_write(xml_path, xml)
-                safe_write(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
-
-                norm_lower = (norm_tag or "").lower()
-                is_allowed_tag = norm_lower in allowed
-                is_cc_url = bool(raw_license and "creativecommons.org" in str(raw_license).lower())
-
-                if is_allowed_tag or is_cc_url:
-                    # Try standard /pdf endpoint
-                    pdf_url = pmcid_to_pdf_url(pmcid)
-                    _sleep(rate)
-                    r = sess.get(pdf_url, timeout=60, allow_redirects=True)
-                    ctype = (r.headers.get("Content-Type") or "").lower()
-
-                    if r.ok and "pdf" in ctype:
-                        safe_write(pdf_path, r.content)
-                    elif r.ok and "html" in ctype:
-                        # Look for <self-uri> in the XML
-                        soup = BeautifulSoup(xml, "lxml-xml")
-                        self_uri = soup.find("self-uri", attrs={"content-type": "pmc-pdf"})
-                        if self_uri and self_uri.has_attr("xlink:href"):
-                            real = requests.compat.urljoin(pdf_url, self_uri["xlink:href"])
-                            rr = sess.get(real, timeout=60, allow_redirects=True)
-                            ctype2 = (rr.headers.get("Content-Type") or "").lower()
-                            if rr.ok and "pdf" in ctype2:
-                                safe_write(pdf_path, rr.content)
-                            else:
-                                print(f"[PMC] self-uri failed pmcid=PMC{pmcid} url={real} ctype={ctype2}")
-                        else:
-                            # Try scraping landing HTML for PDF links
-                            real = resolve_pdf_url_from_html(r.text, pdf_url)
-                            if real:
-                                rr = sess.get(real, timeout=60, allow_redirects=True)
-                                ctype2 = (rr.headers.get("Content-Type") or "").lower()
-                                if rr.ok and "pdf" in ctype2:
-                                    safe_write(pdf_path, rr.content)
-                                else:
-                                    print(f"[PMC] html-follow failed pmcid=PMC{pmcid} url={real} ctype={ctype2}")
-                            else:
-                                print(f"[PMC] no-pdf-link pmcid=PMC{pmcid} page={pdf_url}")
-                    else:
-                        print(f"[PMC] pdf-get failed pmcid=PMC{pmcid} status={r.status_code}")
-                else:
-                    print(f"[PMC] skip license='{norm_tag}' pmcid=PMC{pmcid}")
-
-                pbar.set_postfix_str(meta["license"] or "UNKNOWN")
-
-            except Exception as e:
-                try:
-                    safe_write(out_dir / f"PMC{pmcid}.fail.txt", f"{type(e).__name__}: {e}")
-                except Exception:
-                    pass
-                import traceback
-                traceback.print_exc()
-                print(f"[PMC] ERROR pmcid=PMC{pmcid} → {e}")
+                xml = efetch_pmc_xml(pmcid, email=email, api_key=api_key, rate=rate_per_sec, sess=sess)
+            except requests.HTTPError as e:
+                print(f"[PMC] ERROR pmcid={pmcid} -> {e}")
+                xml_fail += 1
                 continue
+            except Exception as e:
+                print(f"[PMC] ERROR pmcid={pmcid} -> {e}")
+                xml_fail += 1
+                continue
+
+            # License parsing
+            norm_tag, raw_license = parse_license_from_xml(xml)
+
+            # Decide keep or skip
+            keep = False
+            reason = ""
+            if norm_tag and norm_tag in set(allowed_licenses):
+                keep = True
+            elif permit_unlicensed_readonly and (norm_tag is None):
+                keep = True
+                reason = " (permit_unlicensed_readonly)"
+            else:
+                print(f"[PMC] skip license={norm_tag!r} pmcid={pmcid}")
+                skipped_license += 1
+                continue
+
+            # PDF discovery + download
+            urls = pdf_url_candidates(pmcid, xml)
+            pdf_bytes = download_pdf(urls, sess=sess, rate=rate_per_sec, pmcid=pmcid)
+            if not pdf_bytes:
+                pdf_fail += 1
+                continue
+
+            # Write files
+            meta = build_metadata_record(pmcid, xml, norm_tag, raw_license, term)
+            base = os.path.join(q_dir, pmcid)
+            with open(base + ".json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            with open(base + ".pdf", "wb") as f:
+                f.write(pdf_bytes)
+
+            saved += 1
+
+    return {
+        "total_ids": total_ids,
+        "saved": saved,
+        "skipped_license": skipped_license,
+        "xml_fail": xml_fail,
+        "pdf_fail": pdf_fail,
+    }
+
+
+def build_metadata_record(pmcid: str, xml_text: str, norm_license: Optional[str], raw_license: Optional[str], term: str) -> Dict:
+    """
+    A small, resilient metadata extraction using JATS. We keep it minimal to
+    avoid strict schema dependencies.
+    """
+    soup = BeautifulSoup(xml_text, XML_PARSER)
+
+    def _first_text(names: List[str]) -> Optional[str]:
+        for n in names:
+            el = soup.find(n)
+            if el:
+                txt = el.get_text(" ", strip=True)
+                if txt:
+                    return txt
+        return None
+
+    title = _first_text(["article-title", "title"])
+    journal = _first_text(["journal-title"]) or _first_text(["journal-title-group"])
+    year = _first_text(["year"])
+    abstract = _first_text(["abstract"])
+
+    return {
+        "source": "pmc",
+        "pmcid": pmcid,
+        "search_term": term,
+        "title": title,
+        "journal": journal,
+        "year": year,
+        "abstract": abstract,
+        "license": norm_license,
+        "license_raw": raw_license,
+        "record_hash": hashlib.sha256(xml_text.encode("utf-8")).hexdigest(),
+    }
+
+
+# ---------------------------
+# Entry point for run.py
+# ---------------------------
+
+def run_from_config(*args, **kwargs):
+    """
+    Flexible entrypoint so different runners can call:
+      - run_from_config()
+      - run_from_config(cfg)
+      - run_from_config(cfg, out_root)
+      - run_from_config(cfg=..., out_root=...)
+    """
+    # Parse inputs robustly
+    cfg = None
+    out_root = None
+
+    if args:
+        if len(args) == 1 and isinstance(args[0], dict):
+            cfg = args[0]
+        elif len(args) >= 2 and isinstance(args[0], dict):
+            cfg, out_root = args[0], args[1]
+
+    # keyword fallbacks
+    if cfg is None:
+        # allow callers to pass just a dict in kwargs too
+        if "cfg" in kwargs and isinstance(kwargs["cfg"], dict):
+            cfg = kwargs["cfg"]
+        else:
+            # if someone accidentally passed the whole config as kwargs,
+            # accept that (last resort)
+            cfg = kwargs if kwargs else {}
+
+    if out_root is None:
+        out_root = kwargs.get("out_root")
+
+    # default out_root from config if still missing
+    if not out_root:
+        out_root = (cfg.get("paths", {}) or {}).get("raw_dir", "data/raw")
+
+    section = (cfg or {}).get("pmc", {}) or {}
+    if not section.get("enabled", False):
+        print("[PMC] disabled in config; skipping")
+        return {"status": "skipped"}
+
+    queries = section.get("queries", [])
+    email = section.get("email", "")
+    api_key = section.get("api_key", "")
+    rate = float(section.get("rate_per_sec", 1))
+    retmax = int(section.get("max_results_per_query", 2000))
+
+    allowed_licenses = (cfg.get("licenses", {}) or {}).get("allow", []) or []
+    permit_unlicensed_readonly = bool(section.get("permit_unlicensed_readonly", False))
+
+    out = harvest_pmc(
+        out_root=out_root,
+        queries=queries,
+        email=email,
+        api_key=api_key,
+        retmax=retmax,
+        rate_per_sec=rate,
+        allowed_licenses=allowed_licenses,
+        permit_unlicensed_readonly=permit_unlicensed_readonly,
+    )
+    print(f"[ok]   pmc -> {json.dumps(out)}")
+    return out
+
