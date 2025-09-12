@@ -1,254 +1,433 @@
 # src/openstrength/ingest/arxiv.py
-# Standalone arXiv harvester: saves metadata JSON for every hit and downloads PDFs when available.
-
 from __future__ import annotations
-import os
-import re
+
 import json
-import time
 import math
-import logging
+import os
+import random
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 
-# feedparser is convenient; we fall back to ElementTree if it's not installed.
 try:
-    import feedparser  # type: ignore
+    import feedparser  # nicer Atom parsing if available
     HAS_FEEDPARSER = True
 except Exception:
-    HAS_FEEDPARSER = False
     import xml.etree.ElementTree as ET
+    HAS_FEEDPARSER = False
 
-ARXIV_API = "http://export.arxiv.org/api/query"
-ARXIV_PDF = "https://arxiv.org/pdf/{id}.pdf"
+# ----------------------------
+# Config dataclass (internal)
+# ----------------------------
+@dataclass
+class ArxivConfig:
+    enabled: bool
+    queries: List[str]
+    categories: List[str]
+    max_results_per_query: int
+    rate_per_sec: float  # requests/second to API and to PDFs
 
-# ---------- small, local utilities (no external project deps) ----------
+# ----------------------------
+# Utilities
+# ----------------------------
+ARXIV_API = "https://export.arxiv.org/api/query"
+DEFAULT_TIMEOUT = 30
+RETRY_STATUS = {500, 502, 503, 504, 520, 522, 524}
 
-def _mk_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "OpenStrength/ingest (arxiv) +https://arxiv.org",
-        "Accept": "application/xml, text/xml;q=0.9, */*;q=0.1",
-    })
-    adapter = requests.adapters.HTTPAdapter(max_retries=3)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
+def slugify(text: str, maxlen: int = 80) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("/", "-")
+    text = re.sub(r"[^A-Za-z0-9 _.\-]", "", text)
+    text = text.replace(" ", "_")
+    if len(text) > maxlen:
+        text = text[:maxlen]
+    return text or "untitled"
 
-def _safe_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+def mk_session(rate_per_sec: float) -> requests.Session:
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        max_retries=requests.packages.urllib3.util.retry.Retry(
+            total=3,
+            read=3,
+            connect=3,
+            backoff_factor=0.5,
+            status_forcelist=list(RETRY_STATUS),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+    )
+    sess.headers.update({"User-Agent": "OpenStrength/ingest (arxiv) +https://arxiv.org"})
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    # simple throttle controller
+    sess._os_last_call = 0.0  # type: ignore[attr-defined]
+    sess._os_min_interval = 1.0 / max(0.01, rate_per_sec)  # type: ignore[attr-defined]
+    return sess
 
-def _safe_write_json(path: Path, obj: Any) -> None:
+def throttle(sess: requests.Session):
+    now = time.time()
+    elapsed = now - getattr(sess, "_os_last_call", 0.0)
+    wait = getattr(sess, "_os_min_interval", 0.0) - elapsed
+    if wait > 0:
+        time.sleep(wait)
+    sess._os_last_call = time.time()
+
+def safe_write_json(path: Path, obj: Dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def _sanitize_query(q: str) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", q.lower()).strip("_")
+def safe_write_bytes(path: Path, data_iter: Iterable[bytes]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        for chunk in data_iter:
+            if chunk:
+                f.write(chunk)
+    os.replace(tmp, path)
 
-def _log_setup():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s"
-    )
+# ----------------------------
+# Atom parsing
+# ----------------------------
+def parse_entries_atom(atom_text: str) -> List[Dict]:
+    """
+    Returns a list of dict entries with keys:
+    id, title, summary, authors (list[str]), categories (list[str]), links (list[dict]),
+    published, updated, pdf_url (if available)
+    """
+    out: List[Dict] = []
 
-# ---------- arXiv parsing ----------
-
-def _parse_feed_text(xml_text: str) -> List[Dict[str, Any]]:
-    """Parse arXiv Atom feed into a list of dicts (works with or without feedparser)."""
     if HAS_FEEDPARSER:
-        feed = feedparser.parse(xml_text)
-        out: List[Dict[str, Any]] = []
+        feed = feedparser.parse(atom_text)
         for e in feed.entries:
-            arxiv_id = e.get("id", "").split("/")[-1]
-            authors = [a.get("name") for a in e.get("authors", [])] if e.get("authors") else []
             links = []
-            for l in e.get("links", []):
-                links.append({
-                    "href": l.get("href"),
-                    "type": l.get("type"),
-                    "rel": l.get("rel"),
-                })
-            out.append({
-                "id": arxiv_id,
-                "title": e.get("title", "").strip(),
-                "summary": e.get("summary", "").strip(),
-                "published": e.get("published"),
-                "updated": e.get("updated"),
-                "authors": authors,
-                "primary_category": getattr(e, "arxiv_primary_category", {}).get("term") if hasattr(e, "arxiv_primary_category") else None,
-                "categories": [t.get("term") for t in e.get("tags", [])] if e.get("tags") else [],
-                "doi": getattr(e, "arxiv_doi", None),
-                "link": e.get("link"),
-                "links": links,
-            })
+            pdf_url = None
+            for l in getattr(e, "links", []):
+                links.append({"href": l.get("href"), "type": l.get("type"), "rel": l.get("rel")})
+                # arXiv marks the PDF link as rel=related type=application/pdf OR rel=alternate with .pdf
+                href = l.get("href", "")
+                if (l.get("type") == "application/pdf") or href.endswith(".pdf"):
+                    pdf_url = href
+            cats = [c.term for c in getattr(e, "tags", []) if hasattr(c, "term")]
+            authors = [a.name for a in getattr(e, "authors", []) if hasattr(a, "name")]
+            out.append(
+                {
+                    "id": getattr(e, "id", ""),
+                    "title": getattr(e, "title", ""),
+                    "summary": getattr(e, "summary", ""),
+                    "authors": authors,
+                    "categories": cats,
+                    "links": links,
+                    "published": getattr(e, "published", ""),
+                    "updated": getattr(e, "updated", ""),
+                    "pdf_url": pdf_url,
+                }
+            )
         return out
 
-    # Fallback simple XML parsing (ElementTree). Handles the common fields.
-    ns = {
-        "a": "http://www.w3.org/2005/Atom",
-        "arxiv": "http://arxiv.org/schemas/atom",
-    }
-    root = ET.fromstring(xml_text)
-    out: List[Dict[str, Any]] = []
-    for entry in root.findall("a:entry", ns):
-        id_text = (entry.findtext("a:id", default="", namespaces=ns) or "").split("/")[-1]
-        title = (entry.findtext("a:title", default="", namespaces=ns) or "").strip()
-        summary = (entry.findtext("a:summary", default="", namespaces=ns) or "").strip()
-        published = entry.findtext("a:published", default=None, namespaces=ns)
-        updated = entry.findtext("a:updated", default=None, namespaces=ns)
-        authors = [a.findtext("a:name", default="", namespaces=ns) for a in entry.findall("a:author", ns)]
-        links = []
-        for l in entry.findall("a:link", ns):
-            links.append({
-                "href": l.attrib.get("href"),
-                "type": l.attrib.get("type"),
-                "rel": l.attrib.get("rel"),
-            })
-        primary_cat_el = entry.find("arxiv:primary_category", ns)
-        primary_category = primary_cat_el.attrib.get("term") if primary_cat_el is not None else None
-        cats = [t.attrib.get("term") for t in entry.findall("a:category", ns)]
-        doi_el = entry.find("arxiv:doi", ns)
-        doi = doi_el.text if doi_el is not None else None
+    # Fallback: minimal ElementTree parsing
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(atom_text)
+    for e in root.findall("a:entry", ns):
+        _id = e.findtext("a:id", default="", namespaces=ns)
+        title = e.findtext("a:title", default="", namespaces=ns)
+        summary = e.findtext("a:summary", default="", namespaces=ns)
+        published = e.findtext("a:published", default="", namespaces=ns)
+        updated = e.findtext("a:updated", default="", namespaces=ns)
 
-        out.append({
-            "id": id_text,
-            "title": title,
-            "summary": summary,
-            "published": published,
-            "updated": updated,
-            "authors": authors,
-            "primary_category": primary_category,
-            "categories": cats,
-            "doi": doi,
-            "link": next((l["href"] for l in links if l.get("rel") == "alternate"), None),
-            "links": links,
-        })
+        authors = []
+        for a_el in e.findall("a:author", ns):
+            name = a_el.findtext("a:name", default="", namespaces=ns)
+            if name:
+                authors.append(name)
+
+        cats = []
+        for c in e.findall("a:category", ns):
+            term = c.attrib.get("term")
+            if term:
+                cats.append(term)
+
+        links = []
+        pdf_url = None
+        for l in e.findall("a:link", ns):
+            href = l.attrib.get("href")
+            typ = l.attrib.get("type")
+            rel = l.attrib.get("rel")
+            if href:
+                links.append({"href": href, "type": typ, "rel": rel})
+                if (typ == "application/pdf") or href.endswith(".pdf"):
+                    pdf_url = href
+
+        out.append(
+            {
+                "id": _id,
+                "title": title,
+                "summary": summary,
+                "authors": authors,
+                "categories": cats,
+                "links": links,
+                "published": published,
+                "updated": updated,
+                "pdf_url": pdf_url,
+            }
+        )
     return out
 
-def _fetch_batch(sess: requests.Session, query: str, start: int, max_results: int) -> List[Dict[str, Any]]:
-    url = f"{ARXIV_API}?search_query={quote_plus(query)}&start={start}&max_results={max_results}"
-    r = sess.get(url, timeout=60)
+# ----------------------------
+# API querying with pagination
+# ----------------------------
+def build_query_term(user_query: str, categories: List[str]) -> str:
+    """
+    Combine the user's query with category filters, if any.
+    Example: (ti:"creatine" OR abs:"creatine") AND (cat:q-bio OR cat:cs.LG)
+    """
+    q = user_query.strip()
+    if categories:
+        cat_clause = " OR ".join([f"cat:{c}" for c in categories])
+        return f"({q}) AND ({cat_clause})"
+    return q
+
+def fetch_arxiv_batch(sess: requests.Session, query: str, start: int, max_results: int) -> Tuple[List[Dict], int]:
+    params = {
+        "search_query": query,
+        "start": start,
+        "max_results": max_results,
+        # Tip: add sortBy=lastUpdatedDate if you want recency bias. We keep default relevance.
+    }
+    url = f"{ARXIV_API}?{urlencode(params)}"
+    throttle(sess)
+    r = sess.get(url, timeout=DEFAULT_TIMEOUT)
     r.raise_for_status()
-    return _parse_feed_text(r.text)
+    entries = parse_entries_atom(r.text)
 
-def _download_pdf(sess: requests.Session, arxiv_id: str, out_path: Path) -> bool:
-    pdf_url = ARXIV_PDF.format(id=arxiv_id)
-    try:
-        r = sess.get(pdf_url, timeout=90)
-        if r.status_code == 200 and "application/pdf" in r.headers.get("content-type", "").lower():
-            _safe_write_bytes(out_path, r.content)
-            return True
-        logging.info(f"[arxiv] pdf-get skipped id={arxiv_id} status={r.status_code} ctype={r.headers.get('content-type')}")
-    except Exception as e:
-        logging.info(f"[arxiv] pdf-get failed id={arxiv_id} → {e}")
-    return False
+    # Determine totalResults if feedparser exposed it, else approximate
+    total = None
+    if HAS_FEEDPARSER:
+        try:
+            total = int(getattr(feedparser.parse(r.text), "feed", {}).get("opensearch_totalresults", 0))
+        except Exception:
+            total = None
+    if total is None:
+        # Fallback: infer via smart guess (we only know length of this page)
+        total = start + len(entries)
 
-# ---------- public entrypoint ----------
+    return entries, total
 
-def harvest_arxiv(cfg: Dict[str, Any]) -> None:
+# ----------------------------
+# PDF fetching (robust)
+# ----------------------------
+def fetch_pdf_with_retries(arxiv_pdf_url: str, out_path: Path, sess: requests.Session, max_retries: int = 6) -> bool:
     """
-    Harvest arXiv results according to cfg:
-      cfg["paths"]["raw_dir"] -> base data directory
-      cfg["arxiv"]["queries"] -> list[str] arXiv API search queries
-      cfg["arxiv"]["max_results_per_query"] -> int (default 1000)
-      cfg["arxiv"]["sleep_between_requests_sec"] -> float (default 3.0)
-      cfg["arxiv"]["pdf"] -> bool (download PDFs, default True)
+    Download PDF from arXiv with retries/backoff.
+    Returns True if saved successfully, False otherwise.
     """
-    _log_setup()
+    if out_path.exists() and out_path.stat().st_size > 1024:
+        return True
 
-    raw_dir = Path(cfg["paths"]["raw_dir"])
-    out_root = raw_dir / "arxiv"
-    out_root.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, max_retries + 1):
+        try:
+            throttle(sess)
+            r = sess.get(arxiv_pdf_url, timeout=DEFAULT_TIMEOUT, stream=True)
+            ctype = r.headers.get("Content-Type", "")
+            # Handle transient statuses first
+            if r.status_code in RETRY_STATUS:
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        sleep_s = int(ra)
+                    except Exception:
+                        sleep_s = min(60, 2 ** attempt)
+                else:
+                    sleep_s = min(60, 2 ** attempt) + random.uniform(0, 1.0)
+                print(f"[arxiv] pdf-get retry {attempt}/{max_retries} url={arxiv_pdf_url} status={r.status_code}")
+                time.sleep(sleep_s)
+                continue
 
-    arxiv_cfg = cfg.get("arxiv", {})
-    queries: List[str] = arxiv_cfg.get("queries", [])
-    max_per_query: int = int(arxiv_cfg.get("max_results_per_query", 1000))
-    per_request: int = 100  # API soft max
-    sleep_s: float = float(arxiv_cfg.get("sleep_between_requests_sec", 3.0))
-    want_pdf: bool = bool(arxiv_cfg.get("pdf", True))
-
-    if not queries:
-        logging.info("[arxiv] No queries configured; nothing to do.")
-        return
-
-    sess = _mk_session()
-
-    for q in queries:
-        safe_folder = _sanitize_query(q)
-        folder = out_root / safe_folder
-        folder.mkdir(parents=True, exist_ok=True)
-
-        total_saved = 0
-        start = 0
-        while start < max_per_query:
-            try:
-                batch = _fetch_batch(sess, q, start, per_request)
-            except requests.HTTPError as e:
-                logging.info(f"[arxiv] HTTPError for start={start}: {e}")
-                break
-            except Exception as e:
-                logging.info(f"[arxiv] fetch error start={start}: {e}")
-                break
-
-            if not batch:
-                break
-
-            for item in batch:
-                arxiv_id = item["id"]  # may include version (e.g., 2101.00001v2)
-                if not arxiv_id:
+            if r.status_code == 200:
+                if "application/pdf" not in ctype.lower():
+                    # Not a PDF (often text/plain for error page) -> backoff + retry
+                    print(f"[arxiv] pdf-get skipped url={arxiv_pdf_url} status={r.status_code} ctype={ctype}")
+                    time.sleep(min(30, 2 ** attempt) + random.uniform(0, 0.5))
                     continue
 
-                meta_path = folder / f"{arxiv_id}.json"
-                pdf_path = folder / f"{arxiv_id}.pdf"
+                safe_write_bytes(out_path, r.iter_content(chunk_size=1 << 15))
+                return True
 
-                # Always write metadata JSON
-                _safe_write_json(meta_path, item)
+            if r.status_code == 404:
+                print(f"[arxiv] pdf-get 404 not found url={arxiv_pdf_url}")
+                return False
 
-                # Try PDF download (optional)
-                if want_pdf and not pdf_path.exists():
-                    ok = _download_pdf(sess, arxiv_id, pdf_path)
-                    if not ok and pdf_path.exists() and pdf_path.stat().st_size == 0:
-                        pdf_path.unlink(missing_ok=True)
+            # Other non-OK
+            print(f"[arxiv] pdf-get status={r.status_code} url={arxiv_pdf_url}")
+            time.sleep(min(30, 2 ** attempt) + random.uniform(0, 0.5))
 
-                total_saved += 1
+        except requests.RequestException as e:
+            print(f"[arxiv] pdf-get error url={arxiv_pdf_url} err={e.__class__.__name__}: {e}")
+            time.sleep(min(30, 2 ** attempt) + random.uniform(0, 0.5))
 
-            logging.info(f"[arxiv] '{q}': saved {total_saved} records (start={start})")
-            start += per_request
-            time.sleep(sleep_s)
+    # Optional final fallback: try e-print endpoint (comment out to disable)
+    try:
+        ep_url = arxiv_pdf_url.replace("/pdf/", "/e-print/").rsplit(".pdf", 1)[0]
+        throttle(sess)
+        ep = sess.get(ep_url, params={"format": "pdf"}, timeout=DEFAULT_TIMEOUT, stream=True)
+        if ep.status_code == 200 and "application/pdf" in ep.headers.get("Content-Type", "").lower():
+            safe_write_bytes(out_path, ep.iter_content(chunk_size=1 << 15))
+            return True
+        else:
+            print(f"[arxiv] e-print fallback failed url={ep_url} status={ep.status_code} "
+                  f"ctype={ep.headers.get('Content-Type')}")
+    except requests.RequestException as e:
+        print(f"[arxiv] e-print fallback error url={arxiv_pdf_url} err={e}")
 
-        logging.info(f"[arxiv] '{q}': done. total records saved: {total_saved}")
+    return False
 
-# ---------- CLI helper ----------
+# ----------------------------
+# Main per-query harvest
+# ----------------------------
+def harvest_query(
+    sess: requests.Session,
+    out_root: Path,
+    user_query: str,
+    categories: List[str],
+    max_results_per_query: int,
+) -> None:
+    query = build_query_term(user_query, categories)
+    qslug = slugify(user_query)
+    base_dir = out_root / "arxiv" / qslug
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    per_page = 100  # the API supports up to 2000, but smaller pages -> more resilient + nicer progress
+    total_target = max_results_per_query
+    total_seen = 0
+    start = 0
+
+    print(f"[arxiv] query='{user_query}' cats={categories} => '{query}'")
+
+    while total_seen < total_target:
+        to_fetch = min(per_page, total_target - total_seen)
+        try:
+            entries, total_reported = fetch_arxiv_batch(sess, query, start, to_fetch)
+        except requests.HTTPError as e:
+            print(f"[arxiv] API error start={start} err={e}")
+            # gentle backoff then continue
+            time.sleep(3.0)
+            continue
+
+        if not entries:
+            break
+
+        for e in entries:
+            # arXiv ID is the trailing part of entry id, like 'http://arxiv.org/abs/2411.01004v1'
+            raw_id = e.get("id", "")
+            arxiv_id = raw_id.rsplit("/", 1)[-1] if raw_id else None
+            if not arxiv_id:
+                # Skip malformed entries
+                continue
+
+            # per-paper dir
+            paper_dir = base_dir / slugify(arxiv_id)
+            paper_dir.mkdir(parents=True, exist_ok=True)
+
+            # Prepare metadata
+            meta = {
+                "source": "arxiv",
+                "query": user_query,
+                "categories_filter": categories,
+                "arxiv_id": arxiv_id,
+                "title": e.get("title"),
+                "summary": e.get("summary"),
+                "authors": e.get("authors", []),
+                "categories": e.get("categories", []),
+                "links": e.get("links", []),
+                "published": e.get("published"),
+                "updated": e.get("updated"),
+                "pdf_url": e.get("pdf_url"),
+            }
+
+            # Write metadata first
+            safe_write_json(paper_dir / "metadata.json", meta)
+
+            # Try to fetch PDF (if URL known)
+            pdf_url = e.get("pdf_url")
+            if pdf_url:
+                pdf_path = paper_dir / "paper.pdf"
+                ok = fetch_pdf_with_retries(pdf_url, pdf_path, sess)
+                if ok:
+                    meta["pdf_status"] = "ok"
+                    meta["pdf_path"] = str(pdf_path.as_posix())
+                else:
+                    meta["pdf_status"] = "pending"
+                    meta["pdf_path"] = None
+                # Update metadata with final status
+                safe_write_json(paper_dir / "metadata.json", meta)
+
+        got = len(entries)
+        total_seen += got
+        start += got
+
+        # If the API reports fewer total results than we want, stop when we’ve reached it
+        if total_reported is not None and start >= total_reported:
+            break
+
+# ----------------------------
+# Public entrypoint for run.py
+# ----------------------------
+def run_from_config(cfg: Dict, out_root: str | Path) -> None:
+    """
+    Expected by src.openstrength.ingest.run
+    cfg: the full YAML-loaded dict; this function reads cfg["arxiv"]
+    out_root: base directory for outputs (e.g., 'data/raw')
+    """
+    arx = cfg.get("arxiv") or {}
+    enabled = bool(arx.get("enabled", False))
+    if not enabled:
+        print("[arxiv] disabled in config; skipping")
+        return
+
+    queries = list(arx.get("queries") or [])
+    categories = list(arx.get("categories") or [])
+    max_results = int(arx.get("max_results_per_query", 1000))
+    rate_per_sec = float(arx.get("rate_per_sec", 1.0))
+
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    if not queries:
+        print("[arxiv] no queries found; nothing to do")
+        return
+
+    sess = mk_session(rate_per_sec=rate_per_sec)
+
+    for q in queries:
+        try:
+            harvest_query(
+                sess=sess,
+                out_root=out_root,
+                user_query=q,
+                categories=categories,
+                max_results_per_query=max_results,
+            )
+        except Exception as e:
+            print(f"[arxiv] ERROR query='{q}': {e.__class__.__name__}: {e}")
 
 if __name__ == "__main__":
-    # Minimal ad-hoc runner for testing without the orchestrator.
-    import argparse
-    parser = argparse.ArgumentParser(description="Harvest arXiv results.")
-    parser.add_argument("--raw-dir", required=True, help="Path to data/raw")
-    parser.add_argument("--query", action="append", required=True, help="arXiv search_query (repeatable)")
-    parser.add_argument("--max", type=int, default=500, help="Max results per query")
-    parser.add_argument("--no-pdf", action="store_true", help="Do not attempt to download PDFs")
-    parser.add_argument("--sleep", type=float, default=3.0, help="Seconds between API requests")
-    args = parser.parse_args()
+    # minimal manual test (reads environment variables or defaults)
+    import argparse, yaml
 
-    cfg = {
-        "paths": {"raw_dir": args.raw_dir},
-        "arxiv": {
-            "queries": args.query,
-            "max_results_per_query": args.max,
-            "pdf": not args.no_pdf,
-            "sleep_between_requests_sec": args.sleep,
-        },
-    }
-    harvest_arxiv(cfg)
+    p = argparse.ArgumentParser()
+    p.add_argument("--sources", type=str, required=True, help="Path to sources.yaml")
+    args = p.parse_args()
+
+    with open(args.sources, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # out_root from the config (paths.raw_dir), or default to ./data/raw
+    out_root = (cfg.get("paths") or {}).get("raw_dir", "data/raw")
+    run_from_config(cfg, out_root)
