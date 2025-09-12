@@ -76,7 +76,7 @@ parallelism:
 
 unpaywall:
   enabled: true
-  email: "you@example.com"         # REQUIRED by Unpaywall
+  email: "mjainil1201@gmail.com"   # must be a real address; change if needed
   queries:
     - "creatine"
     - "\"resistance training\" OR \"strength training\" OR hypertrophy"
@@ -99,7 +99,7 @@ doaj:
   license_whitelist: ["cc-by", "cc-by-sa", "cc0"]
 
 core:
-  enabled: false                    # set true if you have an API key
+  enabled: false
   api_key: ""
   queries:
     - "creatine"
@@ -111,8 +111,7 @@ core:
   license_whitelist: ["cc-by", "cc-by-sa", "cc0"]
 
 oai_pmh:
-  enabled: true
-  # institutional repositories; add more as needed
+  enabled: false            # disabled until we rewire the module to run_from_config
   endpoints:
     - "https://dash.harvard.edu/oai/request"
     - "https://dspace.mit.edu/oai/request"
@@ -141,7 +140,7 @@ zenodo:
   license_whitelist: ["cc-by", "cc-by-sa", "cc0", "public-domain", "pddl"]
 
 figshare:
-  enabled: true
+  enabled: false           # set true once figshare.py exists and is wired
   queries:
     - "creatine"
     - "\"strength training\" OR \"resistance training\" OR hypertrophy"

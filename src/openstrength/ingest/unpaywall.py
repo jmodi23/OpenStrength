@@ -1,324 +1,287 @@
-#!/usr/bin/env python3
-# -- coding: utf-8 --
-"""
-unpaywall.py
-------------
-Harvest DOIs from Crossref for a given topic/time window,
-query Unpaywall for OA locations, and save metadata + PDFs.
-
-Designed to be usable both:
-  1) as a module: call harvest_unpaywall(...)
-  2) as a CLI:   python -m unpaywall --query "creatine" --email you@example.com --out data/raw/unpaywall
-
-Zero external project deps; only stdlib + requests.
-
-Output layout:
-  <out_dir>/<slug(query)>/
-      crossref.jsonl                (raw Crossref items; one JSON per line)
-      unpaywall.jsonl               (raw Unpaywall responses; one JSON per line)
-      pdf/<doi_slug>.pdf            (downloaded PDFs when available)
-      meta/<doi_slug>.json          (compact summary metadata we use later)
-"""
-
+# unpaywall.py
 from __future__ import annotations
+
+import json
+import logging
 import os
 import re
+import string
 import time
-import json
-import math
-import html
-import queue
-import errno
-import typing as T
-from dataclasses import dataclass, asdict
-from urllib.parse import quote, urlencode
-import logging
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+import urllib.parse as urlparse
 
-try:
-    import requests
-except Exception as e:
-    raise RuntimeError("This script requires the 'requests' package") from e
+import requests
 
+log = logging.getLogger("unpaywall")
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[Unpaywall] %(message)s"))
+    log.addHandler(h)
+log.setLevel(logging.INFO)
 
-# -------------------------
-# small, local utilities
-# -------------------------
+SAFE_CHARS = f"-_.() {string.ascii_letters}{string.digits}"
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def sanitize(s: str, maxlen: int = 120) -> str:
+    if not s:
+        return "na"
+    s = "".join(c for c in s if c in SAFE_CHARS).strip()
+    s = re.sub(r"\s+", "_", s)
+    return s[:maxlen] or "na"
 
-def write_json(path: str, obj: T.Any) -> None:
-    ensure_dir(os.path.dirname(path))
-    with open(path, 'w', encoding='utf-8') as f:
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def write_json(path: Path, obj: dict) -> None:
+    ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
 
-def append_jsonl(path: str, obj: T.Any) -> None:
-    ensure_dir(os.path.dirname(path))
-    with open(path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(obj, ensure_ascii=False))
-        f.write("\n")
-
-def write_bytes(path: str, data: bytes) -> None:
-    ensure_dir(os.path.dirname(path))
-    with open(path, 'wb') as f:
+def write_bytes(path: Path, data: bytes) -> None:
+    ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as f:
         f.write(data)
+    tmp.replace(path)
 
-def slugify(s: str, maxlen: int = 80) -> str:
-    s = s.lower()
-    s = re.sub(r'[^\w\s-]+', '', s)
-    s = re.sub(r'[\s_-]+', '', s).strip('')
-    if len(s) > maxlen:
-        s = s[:maxlen].rstrip('_')
-    return s or "item"
+def rate_sleep(rate_per_sec: float) -> None:
+    if rate_per_sec and rate_per_sec > 0:
+        time.sleep(max(0.0, 1.0 / rate_per_sec))
 
-def make_session(timeout: int = 30) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "OpenStrength-Ingest/1.0 (+https://github.com/)",
-        "Accept": "application/json, /;q=0.8",
-    })
-    s.timeout = timeout
-    return s
+# ---- license normalization & checks ----
+LICENSE_PATTERNS = [
+    (r"cc[-\s]?by[-\s]?(\d\.\d)?", "cc-by"),
+    (r"cc[-\s]?by[-\s]?sa[-\s]?(\d\.\d)?", "cc-by-sa"),
+    (r"cc0|publicdomainzero|pdm", "cc0"),
+    (r"public\s*domain|us-gov|pd", "public-domain"),
+]
 
-def backoff_sleep(i: int, base: float = 1.0, cap: float = 30.0):
-    # i: attempt index starting at 0
-    t = min(cap, base * (2 ** i) + (0.1 * i))
-    time.sleep(t)
-
-
-# -------------------------
-# datatypes
-# -------------------------
-
-@dataclass
-class HarvestResult:
-    total_crossref: int = 0
-    total_unpaywall: int = 0
-    total_pdf_saved: int = 0
-    errors: int = 0
-
-
-# -------------------------
-# Crossref search
-# -------------------------
-
-def crossref_iter(query: str, years: tuple[int,int]|None, rows: int, sess: requests.Session):
-    """
-    Yields raw Crossref 'items' dicts for query within year range.
-    """
-    base = "https://api.crossref.org/works"
-    params = {
-        "query": query,
-        "rows": rows,
-        "sort": "relevance",
-        "select": "DOI,title,issued,type,URL,container-title,author,license,subject",
-    }
-    if years:
-        y0, y1 = years
-        params["filter"] = f"from-pub-date:{y0}-01-01,until-pub-date:{y1}-12-31"
-
-    cursor = "*"
-    seen = 0
-    while True:
-        url = f"{base}?{urlencode(params)}&cursor={quote(cursor)}"
-        r = sess.get(url, timeout=60)
-        if r.status_code >= 500:
-            # retry on 5xx
-            for i in range(4):
-                backoff_sleep(i)
-                r = sess.get(url, timeout=60)
-                if r.ok: break
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("message", {}).get("items", [])
-        if not items:
-            break
-        for it in items:
-            yield it
-            seen += 1
-        cursor = data.get("message", {}).get("next-cursor")
-        if not cursor:
-            break
-        # polite pacing
-        time.sleep(0.1)
-        # guardrail: do not exceed requested rows if rows < default page size
-        if rows and seen >= rows:
-            break
-
-
-# -------------------------
-# Unpaywall lookup
-# -------------------------
-
-def unpaywall_lookup(doi: str, email: str, sess: requests.Session) -> dict|None:
-    """
-    Return full Unpaywall JSON for DOI or None on 404.
-    """
-    if not doi: return None
-    url = f"https://api.unpaywall.org/v2/{quote(doi)}?email={quote(email)}"
-    r = sess.get(url, timeout=60)
-    if r.status_code == 404:
+def norm_license(text: Optional[str]) -> Optional[str]:
+    if not text:
         return None
-    if r.status_code >= 500:
-        for i in range(4):
-            backoff_sleep(i)
-            r = sess.get(url, timeout=60)
-            if r.ok: break
-    r.raise_for_status()
-    return r.json()
-
-def pick_pdf_url(upw: dict) -> str|None:
-    # Prefer best_oa_location url_for_pdf; fall back to first oa_location with url_for_pdf
-    loc = upw.get("best_oa_location") or {}
-    url = loc.get("url_for_pdf") or loc.get("url")
-    if url and url.lower().endswith(".pdf"):
-        return url
-    # try alternate locations
-    for loc in upw.get("oa_locations", []):
-        u = loc.get("url_for_pdf") or loc.get("url")
-        if u and u.lower().endswith(".pdf"):
-            return u
+    t = text.strip().lower()
+    for pat, tag in LICENSE_PATTERNS:
+        if re.search(pat, t):
+            return tag
+    if "creativecommons.org/licenses/by" in t:
+        return "cc-by"
+    if "creativecommons.org/licenses/by-sa" in t:
+        return "cc-by-sa"
+    if "creativecommons.org/publicdomain/zero" in t:
+        return "cc0"
+    if t in {"cc-by", "cc-by-sa", "cc0", "public-domain"}:
+        return t
     return None
 
-def download_pdf(url: str, sess: requests.Session) -> bytes|None:
-    # some URLs are behind 302 redirect
-    r = sess.get(url, timeout=90, allow_redirects=True, stream=True)
-    if r.status_code >= 500:
-        for i in range(4):
-            backoff_sleep(i)
-            r = sess.get(url, timeout=90, allow_redirects=True, stream=True)
-            if r.ok: break
-    if not r.ok:
-        return None
-    content_type = r.headers.get("Content-Type","").lower()
-    if "pdf" not in content_type and not url.lower().endswith(".pdf"):
-        return None
-    return r.content
+def license_allowed(tags: List[str], whitelist: Optional[List[str]], global_allow: Optional[Iterable[str]]) -> bool:
+    if whitelist is None and global_allow is None:
+        return True
+    allow = set(x.lower() for x in (whitelist or []))
+    allow |= set(x.lower() for x in (global_allow or []))
+    if not allow:
+        return True
+    for t in tags:
+        lt = norm_license(t)
+        if lt and lt in allow:
+            return True
+    return False
 
-
-# -------------------------
-# public API
-# -------------------------
-
-def harvest_unpaywall(
-    topic: str,
-    out_dir: str,
-    *,
-    email: str,
-    years: tuple[int,int]|None=(2010, 2025),
-    max_rows: int=1000,
-    sleep_between: float=0.1,
-    allow_non_oa: bool=False,
-    save_pdfs: bool=True,
-) -> HarvestResult:
+# ---- Crossref search → DOI list ----
+def crossref_iter_dois(
+    query: str,
+    date_from: Optional[str],
+    date_until: Optional[str],
+    rows_per_page: int,
+    rate_per_sec: float,
+    session: requests.Session,
+):
     """
-    Find DOIs from Crossref for a topic, query Unpaywall, and save results.
-    Returns a HarvestResult summary. Never raises for individual record failures.
+    Yield DOIs for a Crossref query using query.bibliographic,
+    filtered by from-pub-date / until-pub-date. Paginates with 'cursor'.
     """
-    result = HarvestResult()
-    sess = make_session()
-    qslug = slugify(f"{topic}")
-    base_dir = os.path.join(out_dir, qslug)
-    pdf_dir  = os.path.join(base_dir, "pdf")
-    meta_dir = os.path.join(base_dir, "meta")
-    ensure_dir(pdf_dir); ensure_dir(meta_dir)
+    base = "https://api.crossref.org/works"
+    cursor = "*"
+    params_common = {
+        "query.bibliographic": query,
+        "filter": ",".join(
+            f for f in [
+                f"from-pub-date:{date_from}" if date_from else None,
+                f"until-pub-date:{date_until}" if date_until else None,
+                "type:journal-article",
+            ] if f
+        ),
+        "rows": rows_per_page,
+        "cursor": cursor,
+        "select": "DOI,title,license,issued,type",
+        "mailto": "openstrength@example.org",
+    }
 
-    crossref_log = os.path.join(base_dir, "crossref.jsonl")
-    unpaywall_log = os.path.join(base_dir, "unpaywall.jsonl")
-
-    seen_dois: set[str] = set()
-
-    # 1) Crossref search
-    for item in crossref_iter(topic, years, rows=max_rows, sess=sess):
-        doi = item.get("DOI")
-        if not doi or doi in seen_dois:
-            continue
-        seen_dois.add(doi)
-        append_jsonl(crossref_log, item)
-        result.total_crossref += 1
-
-        # 2) Unpaywall
+    total = 0
+    while True:
         try:
-            upw = unpaywall_lookup(doi, email, sess)
+            rate_sleep(rate_per_sec)
+            r = session.get(base, params=params_common, timeout=60)
+            r.raise_for_status()
+            js = r.json()
         except Exception as e:
-            logging.warning("Unpaywall lookup failed for DOI=%s: %s", doi, e)
-            result.errors += 1
-            continue
-        if upw is None:
-            # no entry in Unpaywall
-            result.total_unpaywall += 1
-            append_jsonl(unpaywall_log, {"doi": doi, "unpaywall": None})
-            continue
+            log.error(f"Crossref query failed for '{query}': {e}")
+            return
 
-        result.total_unpaywall += 1
-        append_jsonl(unpaywall_log, upw)
+        items = js.get("message", {}).get("items", []) or []
+        if not items:
+            if total == 0:
+                log.info(f"Crossref returned no items for query='{query}'")
+            return
 
-        # 3) Save a compact metadata summary (always)
-        summary = {
-            "doi": doi,
-            "title": (upw.get("title") or (item.get("title") or [""])[0]),
-            "is_oa": upw.get("is_oa", False),
-            "oa_status": upw.get("oa_status"),
-            "journal_name": upw.get("journal_name") or (item.get("container-title") or [""])[0],
-            "year": (item.get("issued",{}).get("date-parts") or [[None]])[0][0],
-            "best_oa_location": upw.get("best_oa_location"),
-        }
-        write_json(os.path.join(meta_dir, f"{slugify(doi)}.json"), summary)
+        for it in items:
+            doi = (it.get("DOI") or "").strip()
+            if doi:
+                total += 1
+                yield doi
 
-        # 4) Optionally attempt to fetch the PDF
-        if save_pdfs:
-            url_pdf = pick_pdf_url(upw)
-            if (not allow_non_oa) and not upw.get("is_oa", False):
-                url_pdf = None
-            if url_pdf:
+        nxt = js.get("message", {}).get("next-cursor")
+        if not nxt or nxt == params_common["cursor"]:
+            break
+        params_common["cursor"] = nxt
+
+# ---- Unpaywall lookup ----
+def unpaywall_lookup(
+    doi: str,
+    email: str,
+    session: requests.Session,
+    rate_per_sec: float,
+) -> Optional[dict]:
+    try:
+        rate_sleep(rate_per_sec)
+        url = f"https://api.unpaywall.org/v2/{urlparse.quote(doi)}"
+        r = session.get(url, params={"email": email}, timeout=60)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"Unpaywall lookup failed doi={doi}: {e}")
+        return None
+
+def best_pdf_url(u: dict) -> Tuple[Optional[str], List[str]]:
+    """
+    Return (pdf_url, license_tags) from unpaywall record.
+    """
+    if not u:
+        return None, []
+    # prefer best_oa_location then first oa_location with pdf
+    def collect_tags(loc: Optional[dict]) -> List[str]:
+        tags = []
+        if not loc:
+            return tags
+        lic = loc.get("license") or ""
+        if lic:
+            tags.append(lic)
+        # also try host_type-specific normalized guesses
+        if loc.get("url_for_pdf", ""):
+            if lic:
+                tags.append(lic)
+        return tags
+
+    loc = u.get("best_oa_location") or {}
+    pdf = loc.get("url_for_pdf") or None
+    tags = collect_tags(loc)
+
+    if not pdf:
+        for loc in (u.get("oa_locations") or []):
+            if loc.get("url_for_pdf"):
+                pdf = loc.get("url_for_pdf")
+                tags = collect_tags(loc)
+                break
+
+    # If still nothing, consider url (might be HTML; we don't HTML-scrape here)
+    return pdf, tags
+
+# ---- main entry ----
+def run_from_config(
+    cfg: dict,
+    paths: dict,
+    global_license_allow: Optional[Iterable[str]] = None,
+) -> None:
+    if not cfg.get("enabled", False):
+        log.info("disabled in config; skipping")
+        return
+
+    email = (cfg.get("email") or "").strip()
+    if not email or email == "you@example.com":
+        log.error("Unpaywall requires a real contact email in sources.yaml under unpaywall.email")
+        return
+
+    queries: List[str] = cfg.get("queries", [])
+    date_from: Optional[str] = cfg.get("from")
+    date_until: Optional[str] = cfg.get("to")
+    rows: int = int(cfg.get("rows_per_page", 100))
+    rate_per_sec: float = float(cfg.get("rate_per_sec", 3))
+    whitelist: Optional[List[str]] = cfg.get("license_whitelist")
+
+    out_root = Path(paths.get("raw_dir", "data/raw")) / "unpaywall"
+    ensure_dir(out_root)
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": "OpenStrength-UnpaywallHarvester/1.0"})
+
+    total_dois = 0
+    total_saved = 0
+
+    for q in queries:
+        qslug = sanitize(q or "all")
+        qdir = out_root / qslug
+        ensure_dir(qdir)
+        log.info(f"Crossref → Unpaywall for query='{q}' from={date_from} to={date_until}")
+
+        seen: set[str] = set()
+        for doi in crossref_iter_dois(q, date_from, date_until, rows, rate_per_sec, s):
+            if doi in seen:
+                continue
+            seen.add(doi)
+            total_dois += 1
+
+            urec = unpaywall_lookup(doi, email, s, rate_per_sec)
+            if not urec:
+                continue
+
+            pdf_url, lic_tags = best_pdf_url(urec)
+            # merge with any top-level license fields if present
+            all_licenses = list(lic_tags)
+            # license_allowed will normalize; just include raw strings
+            if not license_allowed(all_licenses, whitelist, global_license_allow):
+                continue
+
+            # write metadata
+            slug = sanitize(doi.replace("/", "_"))
+            out_dir = qdir / slug
+            ensure_dir(out_dir)
+
+            meta = {
+                "query": q,
+                "doi": doi,
+                "unpaywall": urec,
+                "chosen_pdf_url": pdf_url,
+                "licenses_detected": all_licenses,
+            }
+            write_json(out_dir / "metadata.json", meta)
+
+            # download PDF if available
+            if pdf_url:
                 try:
-                    data = download_pdf(url_pdf, sess)
-                    if data:
-                        write_bytes(os.path.join(pdf_dir, f"{slugify(doi)}.pdf"), data)
-                        result.total_pdf_saved += 1
+                    rate_sleep(rate_per_sec)
+                    r = s.get(pdf_url, timeout=90, allow_redirects=True)
+                    r.raise_for_status()
+                    ctype = r.headers.get("Content-Type", "").lower()
+                    if "pdf" in ctype or pdf_url.lower().endswith(".pdf"):
+                        write_bytes(out_dir / "paper.pdf", r.content)
                 except Exception as e:
-                    logging.warning("PDF download failed DOI=%s url=%s : %s", doi, url_pdf, e)
-                    result.errors += 1
+                    log.warning(f"PDF fetch failed doi={doi} url={pdf_url}: {e}")
 
-        # politeness
-        if sleep_between:
-            time.sleep(sleep_between)
+            total_saved += 1
 
-    return result
+        log.info(f"Query done '{q}': DOIs={len(seen)} saved={total_saved}")
 
-
-# -------------------------
-# CLI
-# -------------------------
-
-def _parse_cli(argv=None):
-    import argparse
-    p = argparse.ArgumentParser(description="Unpaywall harvester")
-    p.add_argument("--query", required=True, help="topic query string (e.g., 'creatine')")
-    p.add_argument("--out", required=True, help="output directory (e.g., data/raw/unpaywall)")
-    p.add_argument("--email", required=True, help="contact email for Unpaywall")
-    p.add_argument("--years", default="2010:2025", help="year range 'YYYY:YYYY' (inclusive)")
-    p.add_argument("--rows", type=int, default=1000, help="max Crossref rows to retrieve")
-    p.add_argument("--no-pdf", action="store_true", help="do not try to save PDFs")
-    p.add_argument("--allow-non-oa", action="store_true", help="attempt PDFs even when not OA (not recommended)")
-    return p.parse_args(argv)
-
-def main(argv=None):
-    args = _parse_cli(argv)
-    y0, y1 = None, None
-    if args.years and ":" in args.years:
-        parts = args.years.split(":")
-        y0 = int(parts[0]); y1 = int(parts[1])
-    res = harvest_unpaywall(
-        topic=args.query,
-        out_dir=args.out,
-        email=args.email,
-        years=(y0,y1) if y0 and y1 else None,
-        max_rows=args.rows,
-        save_pdfs=not args.no_pdf,
-        allow_non_oa=args.allow_non_oa,
-    )
-    print(json.dumps(asdict(res), indent=2))
-
-if __name__ == "_main_":
-    main()
+    log.info(f"Unpaywall complete. Total DOIs processed={total_dois}, saved={total_saved}")
