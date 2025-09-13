@@ -387,5 +387,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     return 0
 
+
+def harvest_biorxiv(cfg: dict) -> None:
+    return run_from_config(cfg) if "run_from_config" in globals() else harvest_bio(cfg)  # whichever you implemented
+
 if __name__ == "__main__":
     raise SystemExit(main())

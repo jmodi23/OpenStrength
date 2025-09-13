@@ -267,3 +267,6 @@ def run_from_config(cfg: Dict, paths: Dict, *_args, **_kwargs) -> None:
                 break
 
     log.info(f"done. articles_seen={total_seen} pdfs_saved={total_saved_pdf}")
+
+def harvest_doaj(cfg: dict) -> None:
+    return run_from_config(cfg, cfg.get("paths") or {}) if "run_from_config" in globals() else harvest_doaj(cfg)

@@ -287,3 +287,14 @@ def run_from_config(cfg: dict, paths: dict, *_args, **_kwargs) -> None:
     total_saved = sum(saved_per_domain.values())
     by_dom = ", ".join(f"{k}:{v}" for k, v in sorted(saved_per_domain.items()))
     log.info(f"crawl complete. saved={total_saved} by_domain=[{by_dom}]")
+
+# --- wrapper expected by the orchestrator ---
+def harvest_gov(cfg: dict) -> None:
+    """
+    Orchestrator passes the full YAML dict `cfg`.
+    This wrapper extracts the gov block and paths block and calls the crawler.
+    """
+    paths = cfg.get("paths") or {}
+    gov_cfg = cfg.get("gov") or {}
+    # mimic the crawler's expected signature
+    return run_from_config(gov_cfg, paths)

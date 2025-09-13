@@ -478,3 +478,6 @@ def run_from_config(*args, **kwargs):
     print(f"[ok]   pmc -> {json.dumps(out)}")
     return out
 
+def harvest_pmc(cfg: dict) -> None:
+    return run_from_config(cfg.get("pmc") or {}, cfg.get("paths") or {})
+

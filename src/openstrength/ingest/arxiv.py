@@ -417,6 +417,10 @@ def run_from_config(cfg: Dict, out_root: str | Path) -> None:
         except Exception as e:
             print(f"[arxiv] ERROR query='{q}': {e.__class__.__name__}: {e}")
 
+def harvest_arxiv(cfg: Dict) -> None:
+    out_root = (cfg.get("paths") or {}).get("raw_dir", "data/raw")
+    run_from_config(cfg, out_root)
+
 if __name__ == "__main__":
     # minimal manual test (reads environment variables or defaults)
     import argparse, yaml

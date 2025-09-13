@@ -285,3 +285,7 @@ def run_from_config(
         log.info(f"Query done '{q}': DOIs={len(seen)} saved={total_saved}")
 
     log.info(f"Unpaywall complete. Total DOIs processed={total_dois}, saved={total_saved}")
+
+def harvest_unpaywall(cfg: dict) -> None:
+    return run_from_config(cfg, cfg.get("paths") or {}) if "run_from_config" in globals() else harvest_unpaywall(cfg)
+

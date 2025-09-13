@@ -141,7 +141,7 @@ zenodo:
   license_whitelist: ["cc-by", "cc-by-sa", "cc0", "public-domain", "pddl"]
 
 figshare:
-  enabled: false           # set true once figshare.py exists and is wired
+  enabled: true           # set true once figshare.py exists and is wired
   queries:
     - "creatine"
     - "\"strength training\" OR \"resistance training\" OR hypertrophy"
